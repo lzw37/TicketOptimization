@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 
 import csv
-from gurobipy import *
+# from gurobipy import *
+from ortools.linear_solver import pywraplp
 import matplotlib.pyplot as plt
 
 
@@ -39,7 +40,7 @@ def presolve():
             ticket_dict[ticket_prototype.id][i] = ticket
 
 
-def solve():
+def solve_by_gurobi():
     m = Model('Ticket_Optimization')
 
     # Variables
@@ -174,6 +175,153 @@ def solve():
         print('No feasible solution!!!')
 
 
+def solve_by_google_ortool():
+    solver = pywraplp.Solver.CreateSolver('SCIP')
+    # solver = pywraplp.Solver.CreateSolver('CBC')
+    solver.EnableOutput()
+    # solver.SetNumThreads(16)
+
+    infinity = solver.infinity()
+
+    # Variables
+    # variable d: the departure time cumulative flow for a trip
+    for trip in trip_dict .values():
+        for t in range(0, time_horizon_length):
+            solver.IntVar(0.0, 1.0, 'd_' + trip.id + '_' + str(t))
+
+    # variable theta: the on board binary indicator
+    for trip in trip_dict.values():
+        for t in range(0, time_horizon_length):
+            solver.IntVar(0.0, 1.0, 'theta_' + trip.id + '_' + str(t))
+
+    # variable x: the selection of a ticket instance
+    for ticket_proto in ticket_dict:
+        for ticket in ticket_dict[ticket_proto].values():
+            solver.IntVar(0.0, 1.0, 'x_' + ticket_proto + '_' + str(ticket.sequence))
+
+    # variable s: the start time cumulative flow for a validation
+    for ticket_proto in ticket_dict:
+        for ticket in ticket_dict[ticket_proto].values():
+            for i in range(0, ticket_prototype_dict[ticket_proto].validation_number):
+                for t in range(0, time_horizon_length):
+                    solver.IntVar(0.0, 1.0,
+                             's_' + ticket_proto + '_' + str(ticket.sequence) + '_' + str(i) + '_' + str(t))
+
+    # variable delta: the valid condition indicator
+    for ticket_proto in ticket_dict:
+        for ticket in ticket_dict[ticket_proto].values():
+            for i in range(0, ticket_prototype_dict[ticket_proto].validation_number):
+                for t in range(0, time_horizon_length):
+                    solver.IntVar(0.0, 1.0,
+                             'delta_' + ticket_proto + '_' + str(ticket.sequence) + '_' + str(i) + '_' + str(t))
+
+
+    # constraint 1: cumulative flow for variable d
+    for trip in trip_dict.values():
+        for t in range(0, time_horizon_length - 1):
+            d_t = solver.LookupVariable('d_' + trip.id + '_' + str(t))
+            d_t_plus_1 = solver.LookupVariable('d_' + trip.id + '_' + str(t + 1))
+            solver.Add(d_t <= d_t_plus_1, "ct1_" + trip.id + '_' + str(t))
+
+    # constraint 2: cumulative flow for variable s
+    for ticket_proto in ticket_dict:
+        for ticket in ticket_dict[ticket_proto].values():
+            for i in range(0, ticket_prototype_dict[ticket_proto].validation_number):
+                for t in range(0, time_horizon_length - 1):
+                    s_t = solver.LookupVariable('s_' + ticket_proto + '_' + str(ticket.sequence) + '_' + str(i) + '_' + str(t))
+                    s_t_plus_1 = solver.LookupVariable(
+                        's_' + ticket_proto + '_' + str(ticket.sequence) + '_' + str(i) + '_' + str(t + 1))
+                    solver.Add(s_t <= s_t_plus_1,
+                                "ct3_" + ticket_proto + '_' + str(ticket.sequence) + '_' + str(i) + '_' + str(t))
+
+    # constraint 3: indicator theta
+    for trip in trip_dict.values():
+        for t in range(0, time_horizon_length):
+            theta = solver.LookupVariable('theta_' + trip.id + '_' + str(t))
+            d = solver.LookupVariable('d_' + trip.id + '_' + str(t))
+            if t - trip.duration < 0:
+                d_p = 0
+            else:
+                d_p = solver.LookupVariable('d_' + trip.id + '_' + str(t - trip.duration))
+            solver.Add(theta == d - d_p, "ct2_" + trip.id + '_' + str(t))
+
+    # constraint 4: indicator delta
+    for ticket_proto in ticket_dict:
+        for ticket in ticket_dict[ticket_proto].values():
+            for i in range(0, ticket_prototype_dict[ticket_proto].validation_number):
+                for t in range(0, time_horizon_length):
+                    if t - ticket_prototype_dict[ticket_proto].duration_per_validation < 0:
+                        s_p = 0
+                    else:
+                        s_p = solver.LookupVariable(
+                            's_' + ticket_proto + '_' + str(ticket.sequence) + '_' + str(i) + '_' + str(
+                                t - ticket_prototype_dict[ticket_proto].duration_per_validation))
+                    delta = solver.LookupVariable(
+                        'delta_' + ticket_proto + '_' + str(ticket.sequence) + '_' + str(i) + '_' + str(t))
+                    s = solver.LookupVariable('s_' + ticket_proto + '_' + str(ticket.sequence) + '_' + str(i) + '_' + str(t))
+                    solver.Add(delta == s - s_p,
+                                "ct4_" + ticket_proto + '_' + str(ticket.sequence) + '_' + str(i) + '_' + str(t))
+
+    # constraint 5: departure time windows
+    for trip in trip_dict.values():
+        for t in range(0, time_horizon_length):
+            d_t = solver.LookupVariable('d_' + trip.id + '_' + str(t))
+            if t < trip.earliest_departure_time:
+                solver.Add(d_t == 0, 'ct5_' + trip.id + '_' + str(t))
+            else:
+                if t > trip.latest_departure_time:
+                    solver.Add(d_t == 1, 'ct5_' + trip.id + '_' + str(t))
+
+    # constraint 6: ticket selection - validation mapping
+    for ticket_proto in ticket_dict:
+        for ticket in ticket_dict[ticket_proto].values():
+            x = solver.LookupVariable('x_' + ticket_proto + '_' + str(ticket.sequence))
+            for i in range(0, ticket_prototype_dict[ticket_proto].validation_number):
+                s = solver.LookupVariable('s_' + ticket_proto + '_' + str(ticket.sequence) + '_' + str(i) + '_' + str(
+                    time_horizon_length - 1))
+                solver.Add(x - s == 0, 'ct6_' + ticket_proto + '_' + str(ticket.sequence) + '_' + str(i) + '_' + str(
+                    time_horizon_length - 1))
+
+                s_0 = solver.LookupVariable('s_' + ticket_proto + '_' + str(ticket.sequence) + '_' + str(i) + '_' + str(0))
+                solver.Add(s_0 == 0, 'ct62_' + ticket_proto + '_' + str(ticket.sequence) + '_' + str(i) + '_' + str(0))
+
+    # constraint 7: trip covering
+    for t in range(0, time_horizon_length):
+        for trip in trip_dict.values():
+            theta = solver.LookupVariable('theta_' + trip.id + '_' + str(t))
+
+            supply_sum = 0
+            for ticket_proto in ticket_dict:
+                for ticket in ticket_dict[ticket_proto].values():
+                    for i in range(0, ticket_prototype_dict[ticket_proto].validation_number):
+                        delta = solver.LookupVariable(
+                            'delta_' + ticket_proto + '_' + str(ticket.sequence) + '_' + str(i) + '_' + str(t))
+                        supply_sum += delta
+
+            solver.Add(supply_sum >= theta, 'ct7_' + trip.id + '_' + str(t))
+
+    # objective
+    obj_func = 0
+    for ticket_proto in ticket_dict:
+        for ticket in ticket_dict[ticket_proto].values():
+            obj_func = obj_func + ticket_prototype_dict[ticket_proto].price * solver.LookupVariable('x_' + ticket_proto + '_' + str(ticket.sequence))
+    status = solver.Minimize(obj_func)
+
+    lp = solver.ExportModelAsLpFormat(False)
+    f = open('model.lp', 'w')
+    f.writelines(lp)
+    f.close()
+
+    status = solver.Solve()
+
+    if status == pywraplp.Solver.OPTIMAL:
+        print('Obj value = ', solver.Objective().Value())
+        output_solution_google_ortools(solver)
+        plot()
+    else:
+        print('No feasible solution!!')
+
+
 def read_trip_data():
     csv_file = open('plan.csv', 'r')
     reader = csv.DictReader(csv_file)
@@ -226,6 +374,30 @@ def output_solution(m):
                             t + 1))
 
 
+def output_solution_google_ortools(solver):
+    # output trip departure time
+    for trip in trip_dict.values():
+        for t in range(0, time_horizon_length - 1):
+            d = solver.LookupVariable('d_' + trip.id + '_' + str(t)).solution_value()
+            d_plus_1 = solver.LookupVariable('d_' + trip.id + '_' + str(t + 1)).solution_value()
+            if d == 0 and d_plus_1 == 1:
+                trip.start_time = t + 1
+                print('trip: ' + trip.id + '    start time: ' + str(t + 1))
+
+    # output ticket validation start time
+    for ticket_proto in ticket_dict:
+        for ticket in ticket_dict[ticket_proto].values():
+            for i in range(0, ticket_prototype_dict[ticket_proto].validation_number):
+                for t in range(0, time_horizon_length - 1):
+                    s = solver.LookupVariable('s_' + ticket_proto + '_' + str(ticket.sequence) + '_' + str(i) + '_' + str(t)).solution_value()
+                    s_plus_1 = solver.LookupVariable(
+                        's_' + ticket_proto + '_' + str(ticket.sequence) + '_' + str(i) + '_' + str(t + 1)).solution_value()
+                    if s == 0 and s_plus_1 == 1:
+                        ticket.start_time[i] = t + 1
+                        print('ticket type: ' + ticket_proto + '   validation:' + str(i) + '       start time:' + str(
+                            t + 1))
+
+
 def plot():
     trip_time = list()
     for trip in trip_dict.values():
@@ -270,4 +442,5 @@ read_trip_data()
 read_ticket_data()
 
 presolve()
-solve()
+# solve_by_gurobi()
+solve_by_google_ortool()
